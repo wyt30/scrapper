@@ -99,7 +99,37 @@ function inferOrganization(listingUrl) {
 /**
  * Decide if a link appears to be an investigator profile link.
  */
-function isLikelyProfileLink(anchorText, absoluteUrl, listingUrl) {
+function isLikelyPersonName(text) {
+  const cleaned = cleanText(text);
+  if (!cleaned) return false;
+
+  const words = cleaned.split(' ').filter(Boolean);
+  if (words.length < 2 || words.length > 4) return false;
+
+  // Menu labels are often long phrases and include special characters.
+  if (/[*|:;!?]/.test(cleaned)) return false;
+
+  // Avoid obvious non-person labels.
+  const lower = cleaned.toLowerCase();
+  if (
+    lower.includes('welcome message') ||
+    lower.includes('workplace commitments') ||
+    lower.includes('origins') ||
+    lower.includes('history') ||
+    lower.includes('mission')
+  ) {
+    return false;
+  }
+
+  // Require alphabetic words and avoid phrase-like all-lowercase labels.
+  const alphaWordCount = words.filter((w) => /[a-z]/i.test(w)).length;
+  if (alphaWordCount < 2) return false;
+  if (cleaned === lower) return false;
+
+  return true;
+}
+
+function isLikelyProfileLink(anchorText, absoluteUrl, listingUrl, hasImageContext = false) {
   if (!absoluteUrl) return false;
 
   const text = (anchorText || '').replace(/\s+/g, ' ').trim();
@@ -111,8 +141,9 @@ function isLikelyProfileLink(anchorText, absoluteUrl, listingUrl) {
   if (text.length <= 2) return false;
   if (text === text.toUpperCase() && /[A-Z]/.test(text)) return false;
 
-  // Prefer person-like text (at least two words).
-  if (text.split(' ').length < 2) return false;
+  // Person links on these pages are photo cards with name labels.
+  if (!hasImageContext) return false;
+  if (!isLikelyPersonName(text)) return false;
 
   let linkUrl;
   let listUrl;
@@ -165,7 +196,13 @@ async function extractProfileLinks(listingUrl) {
     const text = $(el).text();
     const absolute = toAbsoluteUrl(listingUrl, href);
 
-    if (!isLikelyProfileLink(text, absolute, listingUrl)) return;
+    const hasImageContext =
+      $(el).find('img').length > 0 ||
+      $(el).siblings('img').length > 0 ||
+      $(el).parent().find('img').length > 0 ||
+      $(el).closest('article, li, div, section').find('img').length > 0;
+
+    if (!isLikelyProfileLink(text, absolute, listingUrl, hasImageContext)) return;
     if (seen.has(absolute)) return;
 
     seen.add(absolute);
