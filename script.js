@@ -1,8 +1,10 @@
 /**
  * Setup:
- * 1) npm install axios cheerio csv-writer
+ * 1) npm install axios cheerio csv-writer dotenv
  * 2) Run: node script.js
  */
+
+require('dotenv').config();
 
 const axios = require('axios');
 const cheerio = require('cheerio');
@@ -38,6 +40,23 @@ const GENERIC_TEXTS = new Set([
   'home',
   'read more',
   'view all'
+]);
+
+const BLOCKED_NAME_TOKENS = new Set([
+  'welcome',
+  'vector',
+  'borne',
+  'respiratory',
+  'research',
+  'skin',
+  'labs',
+  'lab',
+  'programme',
+  'program',
+  'investigator',
+  'investigators',
+  'scientist',
+  'scientists'
 ]);
 
 // Small sleep helper for retry backoff.
@@ -128,6 +147,12 @@ function isLikelyPersonName(text) {
   const alphaWordCount = words.filter((w) => /[a-z]/i.test(w)).length;
   if (alphaWordCount < 2) return false;
   if (cleaned === lower) return false;
+
+  if (words.some((word) => BLOCKED_NAME_TOKENS.has(word.toLowerCase()))) return false;
+
+  // Require at least one likely surname/given-name pattern (capitalized token).
+  const capitalizedWords = words.filter((word) => /^[A-Z][a-z'`.-]+$/.test(word));
+  if (capitalizedWords.length < 2) return false;
 
   return true;
 }
@@ -293,6 +318,20 @@ function pathnameHasBlockedToken(pathname) {
     pathname.includes('/publication');
 }
 
+function isPersonalLinkedInUrl(url) {
+  if (!url || !/linkedin\.com/i.test(url)) return false;
+
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+
+  const path = parsed.pathname.toLowerCase();
+  return path.startsWith('/in/') || path.startsWith('/pub/');
+}
+
 /**
  * Get clean text from a cheerio selection.
  */
@@ -412,7 +451,7 @@ async function summarizeProfileWithOpenAi(context, profileUrl) {
  */
 function extractName($, fallbackText = 'N.A.') {
   const h1 = cleanText($('h1').first().text());
-  if (h1) return h1;
+  if (isLikelyPersonName(h1)) return h1;
 
   const selectors = [
     '[class*="name"]',
@@ -423,10 +462,10 @@ function extractName($, fallbackText = 'N.A.') {
 
   for (const sel of selectors) {
     const txt = cleanText($(sel).first().text());
-    if (txt && txt.split(' ').length >= 2) return txt;
+    if (isLikelyPersonName(txt)) return txt;
   }
 
-  return fallbackText;
+  return isLikelyPersonName(fallbackText) ? fallbackText : 'N.A.';
 }
 
 /**
@@ -502,6 +541,31 @@ function extractResearchInterest($) {
   return inlineFound;
 }
 
+function extractResearchSummary($, fullName) {
+  const candidates = [];
+
+  $('main p, article p, section p, p').each((_, el) => {
+    const txt = cleanText($(el).text());
+    if (!txt) return;
+    if (txt.length < 60 || txt.length > 380) return;
+
+    const lower = txt.toLowerCase();
+    if (
+      lower.includes('copyright') ||
+      lower.includes('cookie') ||
+      lower.includes('privacy policy') ||
+      lower.includes('read more')
+    ) {
+      return;
+    }
+
+    if (fullName && txt.includes(fullName)) return;
+    candidates.push(txt);
+  });
+
+  return candidates.length ? candidates[0] : 'N.A.';
+}
+
 /**
  * Extract profile data from one investigator page.
  */
@@ -519,8 +583,9 @@ async function scrapeProfile(profileUrl, listingUrl, fallbackName = 'N.A.') {
   let linkedIn = 'N.A.';
   $('a[href]').each((_, el) => {
     const href = $(el).attr('href') || '';
-    if (/linkedin\.com/i.test(href)) {
-      linkedIn = toAbsoluteUrl(profileUrl, href) || href;
+    const possibleUrl = toAbsoluteUrl(profileUrl, href) || href;
+    if (isPersonalLinkedInUrl(possibleUrl)) {
+      linkedIn = possibleUrl;
       return false;
     }
     return undefined;
@@ -546,6 +611,7 @@ async function scrapeProfile(profileUrl, listingUrl, fallbackName = 'N.A.') {
 
   const deterministicJobTitle = extractJobTitles($, fullName);
   const deterministicResearchInterest = extractResearchInterest($);
+  const deterministicResearchSummary = extractResearchSummary($, fullName);
 
   const context = buildContextForAi($);
   let aiSummary = {
@@ -562,11 +628,20 @@ async function scrapeProfile(profileUrl, listingUrl, fallbackName = 'N.A.') {
   }
 
   const jobTitle = aiSummary.jobTitle !== 'N.A.' ? aiSummary.jobTitle : deterministicJobTitle;
-  const researchInterest =
-    aiSummary.researchInterest !== 'N.A.' ? aiSummary.researchInterest : deterministicResearchInterest;
+  let researchInterest = 'N.A.';
+  if (deterministicResearchInterest !== 'N.A.') {
+    researchInterest = deterministicResearchInterest;
+  } else if (deterministicResearchSummary !== 'N.A.') {
+    researchInterest = deterministicResearchSummary;
+  } else if (aiSummary.researchInterest !== 'N.A.') {
+    researchInterest = aiSummary.researchInterest;
+  }
 
   if (aiSummary.linkedIn !== 'N.A.') {
-    linkedIn = toAbsoluteUrl(profileUrl, aiSummary.linkedIn) || aiSummary.linkedIn;
+    const aiLinkedIn = toAbsoluteUrl(profileUrl, aiSummary.linkedIn) || aiSummary.linkedIn;
+    if (isPersonalLinkedInUrl(aiLinkedIn)) {
+      linkedIn = aiLinkedIn;
+    }
   }
 
   if (aiSummary.labWebpage !== 'N.A.') {
