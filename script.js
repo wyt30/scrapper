@@ -8,6 +8,9 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const { createObjectCsvWriter } = require('csv-writer');
 
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+
 // Listing pages to scrape.
 const LISTING_URLS = [
   'https://www.a-star.edu.sg/sign/people',
@@ -298,6 +301,113 @@ function cleanText(value) {
 }
 
 /**
+ * Build focused text snippets from profile HTML so the LLM sees contextual signals
+ * without sending the full document.
+ */
+function buildContextForAi($) {
+  const pageTitle = cleanText($('title').first().text());
+
+  const headings = [];
+  $('h1, h2, h3, h4').each((_, el) => {
+    const txt = cleanText($(el).text());
+    if (txt && txt.length <= 140) headings.push(txt);
+  });
+
+  const bodyParagraphs = [];
+  $('main p, article p, section p, p, li').each((_, el) => {
+    const txt = cleanText($(el).text());
+    if (!txt) return;
+    if (txt.length < 25 || txt.length > 420) return;
+    bodyParagraphs.push(txt);
+  });
+
+  const links = [];
+  $('a[href]').each((_, el) => {
+    const href = cleanText($(el).attr('href') || '');
+    if (!href || /^mailto:/i.test(href)) return;
+    const text = cleanText($(el).text());
+    links.push({ text: text || 'N.A.', href });
+  });
+
+  return {
+    pageTitle,
+    headings: headings.slice(0, 30),
+    paragraphs: bodyParagraphs.slice(0, 60),
+    links: links.slice(0, 80)
+  };
+}
+
+/**
+ * Ask OpenAI to summarize role/research and pick best LinkedIn/lab URL candidates.
+ */
+async function summarizeProfileWithOpenAi(context, profileUrl) {
+  if (!OPENAI_API_KEY) {
+    return {
+      jobTitle: 'N.A.',
+      researchInterest: 'N.A.',
+      linkedIn: 'N.A.',
+      labWebpage: 'N.A.'
+    };
+  }
+
+  const inputPayload = {
+    sourceUrl: profileUrl,
+    pageTitle: context.pageTitle,
+    headings: context.headings,
+    paragraphs: context.paragraphs,
+    links: context.links
+  };
+
+  const response = await axios.post(
+    'https://api.openai.com/v1/chat/completions',
+    {
+      model: OPENAI_MODEL,
+      temperature: 0,
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You extract structured profile data from academic profile pages. Return strict JSON only with keys: jobTitle, researchInterest, linkedIn, labWebpage. If unknown, use "N.A.". Use URLs exactly as seen in links when possible.'
+        },
+        {
+          role: 'user',
+          content: `Use this context from a profile page and infer the best values. Prefer explicit evidence and concise summaries. Context: ${JSON.stringify(inputPayload)}`
+        }
+      ]
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 30000
+    }
+  );
+
+  const rawContent =
+    response.data &&
+    response.data.choices &&
+    response.data.choices[0] &&
+    response.data.choices[0].message &&
+    response.data.choices[0].message.content;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(rawContent || '{}');
+  } catch {
+    parsed = {};
+  }
+
+  return {
+    jobTitle: cleanText(parsed.jobTitle) || 'N.A.',
+    researchInterest: cleanText(parsed.researchInterest) || 'N.A.',
+    linkedIn: cleanText(parsed.linkedIn) || 'N.A.',
+    labWebpage: cleanText(parsed.labWebpage) || 'N.A.'
+  };
+}
+
+/**
  * Extract name from profile page with simple deterministic rules.
  */
 function extractName($, fallbackText = 'N.A.') {
@@ -405,7 +515,7 @@ async function scrapeProfile(profileUrl, listingUrl, fallbackName = 'N.A.') {
   const emailHref = $('a[href^="mailto:"]').first().attr('href') || '';
   const workEmail = emailHref ? cleanText(emailHref.replace(/^mailto:/i, '').split('?')[0]) : 'N.A.';
 
-  // LinkedIn from explicit link only.
+  // LinkedIn from explicit link only (deterministic fallback).
   let linkedIn = 'N.A.';
   $('a[href]').each((_, el) => {
     const href = $(el).attr('href') || '';
@@ -416,7 +526,7 @@ async function scrapeProfile(profileUrl, listingUrl, fallbackName = 'N.A.') {
     return undefined;
   });
 
-  // Lab webpage from explicit link text/href only.
+  // Lab webpage from explicit link text/href only (deterministic fallback).
   let labWebpage = 'N.A.';
   $('a[href]').each((_, el) => {
     const href = $(el).attr('href') || '';
@@ -434,8 +544,34 @@ async function scrapeProfile(profileUrl, listingUrl, fallbackName = 'N.A.') {
     return undefined;
   });
 
-  const jobTitle = extractJobTitles($, fullName);
-  const researchInterest = extractResearchInterest($);
+  const deterministicJobTitle = extractJobTitles($, fullName);
+  const deterministicResearchInterest = extractResearchInterest($);
+
+  const context = buildContextForAi($);
+  let aiSummary = {
+    jobTitle: 'N.A.',
+    researchInterest: 'N.A.',
+    linkedIn: 'N.A.',
+    labWebpage: 'N.A.'
+  };
+
+  try {
+    aiSummary = await summarizeProfileWithOpenAi(context, profileUrl);
+  } catch (error) {
+    console.warn(`OpenAI summary unavailable for ${profileUrl}: ${error.message}`);
+  }
+
+  const jobTitle = aiSummary.jobTitle !== 'N.A.' ? aiSummary.jobTitle : deterministicJobTitle;
+  const researchInterest =
+    aiSummary.researchInterest !== 'N.A.' ? aiSummary.researchInterest : deterministicResearchInterest;
+
+  if (aiSummary.linkedIn !== 'N.A.') {
+    linkedIn = toAbsoluteUrl(profileUrl, aiSummary.linkedIn) || aiSummary.linkedIn;
+  }
+
+  if (aiSummary.labWebpage !== 'N.A.') {
+    labWebpage = toAbsoluteUrl(profileUrl, aiSummary.labWebpage) || aiSummary.labWebpage;
+  }
 
   return {
     fullName,
