@@ -129,17 +129,32 @@ function isLikelyPersonName(text) {
   return true;
 }
 
+function isLikelyNameSlug(segment) {
+  const cleaned = cleanText((segment || '').replace(/[-_]+/g, ' ')).toLowerCase();
+  if (!cleaned) return false;
+  if (GENERIC_TEXTS.has(cleaned)) return false;
+
+  const parts = cleaned.split(' ').filter(Boolean);
+  if (parts.length < 2 || parts.length > 5) return false;
+
+  // Avoid role/category slugs.
+  if (parts.some((p) => ['people', 'scientists', 'investigators', 'programme', 'program', 'adjunct', 'lead', 'leads'].includes(p))) {
+    return false;
+  }
+
+  return parts.every((p) => /^[a-z]+$/.test(p));
+}
+
 function isLikelyProfileLink(anchorText, absoluteUrl, listingUrl, hasImageContext = false) {
   if (!absoluteUrl) return false;
 
   const text = (anchorText || '').replace(/\s+/g, ' ').trim();
   const lowerText = text.toLowerCase();
 
-  // Exclude empty/generic/fully-uppercase menu-like labels.
+  // Exclude empty/generic labels.
   if (!text) return false;
   if (GENERIC_TEXTS.has(lowerText)) return false;
   if (text.length <= 2) return false;
-  if (text === text.toUpperCase() && /[A-Z]/.test(text)) return false;
 
   // Person links on these pages are photo cards with name labels.
   if (!hasImageContext) return false;
@@ -209,7 +224,70 @@ async function extractProfileLinks(listingUrl) {
     links.push({ url: absolute, anchorText: (text || '').trim() });
   });
 
+  // Fallback strategy for pages where profile cards do not use visible <img> tags
+  // or where names are not rendered as the anchor text.
+  if (links.length < 2) {
+    const fallbackCandidates = [];
+
+    $('a[href]').each((_, el) => {
+      const href = $(el).attr('href');
+      const text = cleanText($(el).text());
+      const absolute = toAbsoluteUrl(listingUrl, href);
+      if (!absolute || seen.has(absolute)) return;
+
+      let linkUrl;
+      let listUrl;
+      try {
+        linkUrl = new URL(absolute);
+        listUrl = new URL(listingUrl);
+      } catch {
+        return;
+      }
+
+      if (linkUrl.hostname !== listUrl.hostname) return;
+
+      const listPath = listUrl.pathname.toLowerCase().replace(/\/+$/, '');
+      const linkPath = linkUrl.pathname.toLowerCase().replace(/\/+$/, '');
+      if (!linkPath || linkPath === listPath || !linkPath.startsWith('/idlabs/') && !linkPath.startsWith('/asrl/')) return;
+
+      const linkSegments = linkPath.split('/').filter(Boolean);
+      const listSegments = listPath.split('/').filter(Boolean);
+      if (linkSegments.length <= listSegments.length) return;
+
+      const lastSegment = linkSegments[linkSegments.length - 1];
+      const textLooksLikeName = isLikelyPersonName(text);
+      const slugLooksLikeName = isLikelyNameSlug(lastSegment);
+
+      if (!textLooksLikeName && !slugLooksLikeName) return;
+      if (pathnameHasBlockedToken(linkPath)) return;
+
+      const isWithinListingPath = linkPath.startsWith(`${listPath}/`);
+      fallbackCandidates.push({
+        url: absolute,
+        anchorText: text,
+        priority: isWithinListingPath ? 0 : 1
+      });
+    });
+
+    fallbackCandidates
+      .sort((a, b) => a.priority - b.priority)
+      .forEach((candidate) => {
+        if (links.length >= 2 || seen.has(candidate.url)) return;
+        seen.add(candidate.url);
+        links.push({ url: candidate.url, anchorText: candidate.anchorText || 'N.A.' });
+      });
+  }
+
   return links.slice(0, 2);
+}
+
+function pathnameHasBlockedToken(pathname) {
+  return pathname.endsWith('.pdf') ||
+    pathname.endsWith('.doc') ||
+    pathname.endsWith('.docx') ||
+    pathname.includes('/news') ||
+    pathname.includes('/event') ||
+    pathname.includes('/publication');
 }
 
 /**
